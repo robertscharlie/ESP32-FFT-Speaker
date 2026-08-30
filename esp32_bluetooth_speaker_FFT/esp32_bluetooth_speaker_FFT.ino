@@ -1,28 +1,16 @@
 /*
   ESP32 Bluetooth Speaker — BT phase, with live FFT spectrum display
-  --------------------------------------------------------------------
   - A2DP Bluetooth sink, audio out via internal DAC (GPIO25 = L, GPIO26 = R)
-  - SSD1306 OLED (I2C on GPIO14/27) shows connection status, play/pause,
-    scrolling track info, and a live 16-band FFT spectrum
-  - Buttons: volume up/down, play/pause, mode (mode is wired but not yet
-    functional — reserved for the AM radio switch you'll add later)
+  - SSD1306 OLED (I2C on GPIO14/27): connection status, play/pause,
+    scrolling track info, live 16-band FFT spectrum
+  - Buttons: volume up/down, play/pause, mode (reserved for AM radio switch)
 
   Libraries required:
     - "ESP32-A2DP" by pschatzmann (manual ZIP install)
-    - "arduino-audio-tools" by pschatzmann (manual ZIP install — required
-      by ESP32-A2DP for audio output on current library versions)
+    - "arduino-audio-tools" by pschatzmann (manual ZIP install)
     - "Adafruit SSD1306" (Library Manager)
     - "Adafruit GFX Library" (Library Manager)
     - "arduinoFFT" by kosme (Library Manager)
-
-  NOTE: this uses AnalogAudioStream from the AudioTools library to drive
-  the ESP32's internal DAC (GPIO25/26) — the older direct i2s_config_t
-  approach has been dropped from current ESP32-A2DP versions.
-
-  HOW THE FFT TAP WORKS: separately from the audio *output* path above,
-  set_stream_reader() below gives a callback with the raw decoded PCM
-  samples as they arrive from the phone — this is what gets analyzed.
-  It runs alongside normal playback and doesn't affect it.
 */
 
 #include "AudioTools.h"
@@ -31,6 +19,10 @@
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 #include <arduinoFFT.h>
+
+// Forward declaration: Arduino auto-generates function prototypes right
+// after the includes, before struct Button is defined below.
+struct Button;
 
 // ---------- Pins ----------
 #define I2C_SDA      14
@@ -83,7 +75,7 @@ volatile bool fftBufferReady = false;
 int fftWriteIndex = 0;
 int16_t fftCaptureBuffer[FFT_SAMPLES];
 
-float bandValues[NUM_BANDS] = {0}; // current bar heights (0-100), with decay applied
+float bandValues[NUM_BANDS] = {0}; // current bar heights (0-100)
 
 // Called from the Bluetooth stack's task context — kept deliberately light
 // (just copying samples) so it never delays audio playback itself.
@@ -102,16 +94,31 @@ void read_data_stream(const uint8_t *data, uint32_t length) {
   }
 }
 
-// Groups the FFT's linear frequency bins into NUM_BANDS log-spaced bands
-// (so each band roughly covers an octave, matching how pitch is perceived),
-// then applies peak-hold-with-decay so the bars fall smoothly rather than
-// jumping straight to each new value.
+// Groups the FFT's linear bins into NUM_BANDS log-spaced bands (each
+// roughly an octave). Each band auto-calibrates against its own recent
+// quietest/loudest level in dB (snaps instantly to a new extreme, relaxes
+// back slowly otherwise) so bars stay scaled to whatever's playing instead
+// of a fixed window that clips on loud songs or sits flat on quiet ones.
+// Bar heights get no smoothing — set straight from each frame's reading.
+float bandFloorDb[NUM_BANDS] = {0};
+float bandCeilDb[NUM_BANDS]  = {0};
+
 void computeBands() {
   int usableBins = FFT_SAMPLES / 2; // upper half of the FFT output is redundant for real input
 
+  // Skip bin 0 (DC) and bin 1: the 256-sample window is too short to
+  // resolve anything below ~170Hz, so content down there is mostly leakage.
+  const int minBin = 2;
+
+  // How fast the floor/ceiling relax back when the signal isn't setting a
+  // new extreme — in dB per FFT block (roughly every ~12ms).
+  const float RANGE_RELEASE = 0.05f;
+  // Never let the scale collapse to (near) zero width.
+  const float MIN_SPAN_DB = 6.0f;
+
   for (int band = 0; band < NUM_BANDS; band++) {
-    int startBin = 1 + (int)pow((float)usableBins, (float)band / NUM_BANDS);
-    int endBin   = 1 + (int)pow((float)usableBins, (float)(band + 1) / NUM_BANDS);
+    int startBin = minBin + (int)pow((float)usableBins, (float)band / NUM_BANDS);
+    int endBin   = minBin + (int)pow((float)usableBins, (float)(band + 1) / NUM_BANDS);
     if (endBin <= startBin) endBin = startBin + 1;
     if (endBin > usableBins) endBin = usableBins;
 
@@ -119,20 +126,26 @@ void computeBands() {
     for (int bin = startBin; bin < endBin; bin++) {
       if (vReal[bin] > peak) peak = vReal[bin];
     }
-
-    // Rough dB conversion, then normalize to 0-100 for display.
-    // The 20/90 bounds below are a starting guess for typical line-level
-    // signal strength — adjust them by ear once you see it running.
     float db = (peak > 0) ? 20.0 * log10(peak) : 0;
-    float normalized = (db - 20.0) / (90.0 - 20.0) * 100.0;
-    normalized = constrain(normalized, 0, 100);
 
-    if (normalized > bandValues[band]) {
-      bandValues[band] = normalized;   // rise instantly
+    if (db > bandCeilDb[band]) {
+      bandCeilDb[band] = db;             // new loudest moment: snap up now
     } else {
-      bandValues[band] -= 4;           // decay speed — tune to taste
-      if (bandValues[band] < 0) bandValues[band] = 0;
+      bandCeilDb[band] -= RANGE_RELEASE; // otherwise ease back down
     }
+
+    if (db < bandFloorDb[band]) {
+      bandFloorDb[band] = db;            // new quietest moment: snap down now
+    } else {
+      bandFloorDb[band] += RANGE_RELEASE; // otherwise ease back up
+    }
+
+    if (bandCeilDb[band] - bandFloorDb[band] < MIN_SPAN_DB) {
+      bandCeilDb[band] = bandFloorDb[band] + MIN_SPAN_DB;
+    }
+
+    float normalized = (db - bandFloorDb[band]) / (bandCeilDb[band] - bandFloorDb[band]) * 100.0;
+    bandValues[band] = constrain(normalized, 0, 100);
   }
 }
 
@@ -235,14 +248,23 @@ void updateDisplay() {
 
   display.drawLine(0, 30, SCREEN_WIDTH, 30, SSD1306_WHITE);
 
-  // --- FFT spectrum bars ---
+  // --- FFT spectrum bars: rounded pill bars that grow outward from a
+  //     center line instead of sitting on the bottom ---
   int barsTop = 32, barsBottom = 60;
   int barsHeight = barsBottom - barsTop;
+  int midY = (barsTop + barsBottom) / 2;
   int barWidth = SCREEN_WIDTH / NUM_BANDS;
+
   for (int i = 0; i < NUM_BANDS; i++) {
-    int h = (int)(bandValues[i] / 100.0 * barsHeight);
     int x = i * barWidth;
-    display.fillRect(x, barsBottom - h, barWidth - 1, h, SSD1306_WHITE);
+    int w = (barWidth - 2) / 2;             // about half as thin as before
+    int barX = x + (barWidth - w) / 2;      // keep it centered in its slot
+    int h = (int)(bandValues[i] / 100.0f * barsHeight);
+
+    if (h > 0) {
+      int r = min(2, h / 2); // rounded ends; shrinks for short bars so it never looks odd
+      display.fillRoundRect(barX, midY - h / 2, w, h, r, SSD1306_WHITE);
+    }
   }
 
   // --- Thin volume indicator, bottom edge ---
@@ -269,9 +291,13 @@ void setup() {
   display.clearDisplay();
   display.display();
 
-  // Audio output (internal DAC on GPIO25/26) is already configured by the
-  // AnalogAudioStream 'out' object passed into the a2dp_sink constructor
-  // above — no manual I2S setup needed here.
+  // Start the DAC explicitly with the exact format A2DP streams (rather
+  // than trusting defaultConfig()) so it's never a mismatch guess.
+  auto dac_cfg = out.defaultConfig();
+  dac_cfg.sample_rate = 44100;
+  dac_cfg.channels = 2;
+  dac_cfg.bits_per_sample = 16;
+  out.begin(dac_cfg);
 
   a2dp_sink.set_on_connection_state_changed(connection_state_changed);
   a2dp_sink.set_avrc_rn_playstatus_callback(avrc_rn_playstatus_callback);
@@ -307,8 +333,11 @@ void loop() {
 
   // Run the FFT whenever a fresh buffer of samples has been captured
   if (fftBufferReady) {
+    double mean = 0; // remove DC bias before windowing
+    for (int i = 0; i < FFT_SAMPLES; i++) mean += fftCaptureBuffer[i];
+    mean /= FFT_SAMPLES;
     for (int i = 0; i < FFT_SAMPLES; i++) {
-      vReal[i] = (double)fftCaptureBuffer[i];
+      vReal[i] = (double)fftCaptureBuffer[i] - mean;
       vImag[i] = 0.0;
     }
     fftBufferReady = false; // release the capture buffer back to the audio callback
@@ -319,8 +348,6 @@ void loop() {
     computeBands();
   }
 
-  // Faster than before (was 200ms) so the spectrum bars feel responsive —
-  // the OLED itself can't usefully refresh much quicker than this over I2C.
   static unsigned long lastDisplayUpdate = 0;
   if (millis() - lastDisplayUpdate > 50) {
     updateDisplay();
